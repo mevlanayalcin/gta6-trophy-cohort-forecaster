@@ -5,7 +5,10 @@ Reads every *.in in MAKEFUN_INPUT_DIR (default /input), in name order,
 and writes <id>.out to MAKEFUN_OUTPUT_DIR (default /output).  Python 3.13
 standard library only; deterministic and run with -P -s.
 
-The forecasting model lives in model.py beside this file.
+The forecasting model lives in model.py beside this file: a count-level
+cohort model of Exophase's refresh states, sampled and rounded to the page's
+2 decimals.  Any case it cannot handle gets a persistence forecast, so every
+case stays valid.
 """
 
 from __future__ import annotations
@@ -53,6 +56,22 @@ def _persistence_fallback(case: dict):
     return rows
 
 
+def _check_rows(rows, case: dict) -> None:
+    """Raise unless rows are exactly the shape the grader accepts."""
+    want = [t.get("id") for t in case.get("trophies") or []]
+    if not isinstance(rows, list) or sorted(map(str, (r.get("id") for r in rows))) != sorted(map(str, want)):
+        raise ValueError("rows do not match the case's trophies")
+    for row in rows:
+        q = row.get("q")
+        if set(row) != {"id", "q"} or not isinstance(q, list) or len(q) != len(LEVELS):
+            raise ValueError("bad row")
+        prev = 0.0
+        for v in q:
+            if not isinstance(v, (int, float)) or not math.isfinite(v) or v < prev or v > 100.0:
+                raise ValueError("bad quantile")
+            prev = v
+
+
 def main() -> int:
     in_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR") or "/input")
     out_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output")
@@ -73,11 +92,7 @@ def main() -> int:
             with path.open("r", encoding="utf-8") as fh:
                 case = json.load(fh)
             rows = forecast_case(case)
-            if not isinstance(rows, list) or len(rows) != len(case.get("trophies") or []):
-                raise ValueError("row count mismatch")
-            for row in rows:
-                if not isinstance(row.get("q"), list) or len(row["q"]) != len(LEVELS):
-                    raise ValueError("bad row")
+            _check_rows(rows, case)
         except Exception:
             try:
                 rows = _persistence_fallback(case if isinstance(case, dict) else {})
