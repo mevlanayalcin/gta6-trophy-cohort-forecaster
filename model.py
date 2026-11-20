@@ -19,6 +19,20 @@ model works on counts, not on printed rates:
    every draw to the page's 2 decimals and write the empirical quantiles, so
    the forecast lands on the values the page can print.
 
+R3 (calibrated 2026-11-20 on the live Exophase reads to 33.6 h after release)
+adds two things to this:
+
+5. Removed earners.  The launch-night accounts that held every trophy left the
+   page between 2026-11-19 21:44Z and 2026-11-20 09:37Z (the platinum went
+   from 0.03% to 0.00%).  E is non-decreasing only after its last drop, and a
+   trophy's launch base is cut to what the page still shows.
+6. A hierarchical story chain.  Chapter k+1 is reached by chapter k's earners
+   after a longer play time: its posterior mixes its own grid with the
+   parent's posterior shifted up the m grid (x1.27^0..6, same or wider sigma,
+   p x 0.6..1).  Story missions borrow from the deepest chapter at least as
+   many players hold.  The chain carries most weight while a step has fewer
+   than 10 earners of its own, and is off until a refresh has been observed.
+
 Standard library only, deterministic (seeded per case and trophy).
 """
 
@@ -243,11 +257,42 @@ def earner_intervals(states, m):
             run = v if run is None else min(run, v)
             env_hi[j][i] = run
         ok = all(env_lo[j][i] <= env_hi[j][i] for j in range(k))
-        if not ok:  # players removed: fall back to each read's own interval
+        if not ok:
+            # earners removed (the launch-night test accounts that held the
+            # platinum left the page between 2026-11-19 21:44Z and 11-20 09:37Z):
+            # E is non-decreasing only after the last drop, so tighten from there
+            cut = 0
+            for j in range(1, k):
+                if states[j].hi[i] < max(states[jj].lo[i] for jj in range(j)):
+                    cut = j
             for j in range(k):
                 env_lo[j][i] = states[j].lo[i]
                 env_hi[j][i] = states[j].hi[i]
+            run = 0
+            for j in range(cut, k):
+                run = max(run, states[j].lo[i])
+                env_lo[j][i] = run
+            run = None
+            for j in range(k - 1, cut - 1, -1):
+                v = states[j].hi[i]
+                run = v if run is None else min(run, v)
+                env_hi[j][i] = max(run, env_lo[j][i])
     return env_lo, env_hi
+
+
+def removal_base(states, env_lo, env_hi, i, b0):
+    """Launch base still on the page, and the first state that shows it.
+
+    When earners were removed the base drops to what the page still shows
+    from the first state below the old base on; earlier states keep the old
+    base, so the removed accounts never pass for real earners."""
+    cut = len(states)
+    b_new = b0
+    for j in range(1, len(states)):
+        if env_hi[j][i] < b_new:
+            cut = min(cut, j)
+            b_new = float(env_hi[j][i])
+    return b_new, cut, b0
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +476,71 @@ P_PRIOR = {
 M_FLOOR = {"platinum": 250.0, "completion": 250.0, "grind": 30.0}
 
 
+# hierarchical story chain (R3) ---------------------------------------------
+CHAIN_W = 0.75                      # prior weight of "this step follows its parent"
+CHAIN_W_DATA = 0.10                 # ... once the step has CHAIN_DATA_X earners of its own
+CHAIN_DATA_X = 10.0
+CHAIN_S = ((0.6, 0.25), (0.8, 0.35), (1.0, 0.40))   # p scale and its prior
+# (m-grid shift, sigma-grid shift): chapter k+1 takes m x 1.27^0 .. 1.27^6 of
+# chapter k's time, with the same or a wider spread of reach times
+CHAIN_SHIFT = tuple((j, d) for j in range(0, 7) for d in (0, 1))
+MISSION_SHIFT = tuple((j, d) for j in range(-4, 7) for d in (0, 1))
+TOP_K = 60
+
+
+def _chapter_no(tr):
+    d = str(tr.get("description") or "").strip().lower()
+    for n in range(1, 10):
+        if d == "complete chapter %d." % n:
+            return n
+    if d == "complete the final mission.":
+        return 99
+    return None
+
+
+def story_parents(trophies, last_rates):
+    """i -> (parent index, allowed m-grid shifts) for the story trophies."""
+    chain = sorted((_chapter_no(t), i) for i, t in enumerate(trophies) if _chapter_no(t) is not None)
+    par = {}
+    for (_, a), (_, b) in zip(chain, chain[1:]):
+        par[b] = (a, CHAIN_SHIFT)
+    for i, t in enumerate(trophies):
+        if i in par or _chapter_no(t) is not None or trophy_kind(t) != "story":
+            continue
+        r = last_rates[i] if i < len(last_rates) else None
+        if r is None:
+            continue
+        # the deepest chapter that at least as many players hold (at a tie on
+        # the launch-night base that is the latest one: the simulated-week
+        # backtest preferred it to the deepest chapter more players hold)
+        cand = [c for _, c in chain if last_rates[c] is not None and last_rates[c] >= r]
+        if cand:
+            par[i] = (cand[-1], MISSION_SHIFT)
+    return par
+
+
+def _depth(parents, i):
+    d = 0
+    while i in parents and d < 50:
+        i = parents[i][0]
+        d += 1
+    return d
+
+
+def _top(post, wts):
+    """The posterior's heaviest points (99% of its weight, at most TOP_K)."""
+    tot = sum(wts) or 1.0
+    idx = sorted(range(len(post)), key=lambda k: (-wts[k], k))
+    keep, acc = [], 0.0
+    for k in idx:
+        keep.append(k)
+        acc += wts[k]
+        if acc >= 0.99 * tot or len(keep) >= TOP_K:
+            break
+    z = sum(wts[k] for k in keep) or 1.0
+    return [post[k] for k in keep], [wts[k] / z for k in keep]
+
+
 # ---------------------------------------------------------------------------
 # the forecast
 # ---------------------------------------------------------------------------
@@ -485,9 +595,14 @@ def forecast_case(case):
     mis = MIS0 + MIS * ahead
     seed_base = _case_seed(case)
     rows = []
-    qrows = []
-    for i, tr in enumerate(trophies):
-        b0 = 0.5 * (env_lo[0][i] + env_hi[0][i])
+    qrows = [None] * m
+    parents = story_parents(trophies, last.rates)
+    posts = {}
+    # parents before children, so a story step can borrow its parent's posterior
+    order = sorted(range(m), key=lambda i: (_depth(parents, i), i))
+    for i in order:
+        tr = trophies[i]
+        b0, j_cut, b_old = removal_base(states, env_lo, env_hi, i, 0.5 * (env_lo[0][i] + env_hi[0][i]))
         e_lo_last = env_lo[-1][i]
         e_hi_last = env_hi[-1][i]
         e_last = 0.5 * (e_lo_last + e_hi_last)
@@ -505,22 +620,56 @@ def forecast_case(case):
             xs = []
             for j in obs_idx:
                 lo, hi = env_lo[j][i], env_hi[j][i]
-                xs.append((0.5 * (lo + hi) - b0, (hi - lo) ** 2 / 12.0))
-            post = []
+                xs.append((0.5 * (lo + hi) - (b0 if j >= j_cut else b_old), (hi - lo) ** 2 / 12.0))
+
+            def chi_of(g, p):
+                chi = 0.0
+                for (x, rv), b in zip(xs, b_obs[g]):
+                    mu = p * b
+                    v = PHI * (mu if mu > 1.0 else 1.0) + (KAPPA * mu) ** 2 + rv
+                    d = x - mu
+                    chi += d * d / v
+                return chi
+
+            indep = []
             for g in range(len(grid)):
                 if grid[g][0] < m_floor:
                     continue
-                bo = b_obs[g]
                 for k, p in enumerate(P_GRID):
-                    chi = 0.0
-                    for (x, rv), b in zip(xs, bo):
-                        mu = p * b
-                        v = PHI * (mu if mu > 1.0 else 1.0) + (KAPPA * mu) ** 2 + rv
-                        d = x - mu
-                        chi += d * d / v
-                    post.append((g, p, chi, pp[k]))
+                    indep.append((g, p, chi_of(g, p), pp[k]))
+            post = indep
+            par = parents.get(i)
+            # only once a refresh has been observed is the parent's posterior
+            # learned from data; before that it is just the prior again
+            if par is not None and par[0] in posts and obs_idx:
+                # hierarchical story chain: this step is reached by the
+                # parent's earners after a longer play time (m shifted up the
+                # log grid) and by no more of them (p scaled down)
+                ppost, pw = posts[par[0]]
+                chain = []
+                cache = {}
+                for (g, p, _, _), w in zip(ppost, pw):
+                    for jsh, dsg in par[1]:
+                        si = g % 3 + dsg
+                        g2 = g - g % 3 + 3 * jsh + si
+                        if si > 2 or g2 < 0 or g2 >= len(grid) or grid[g2][0] < m_floor:
+                            continue
+                        for s_, ws in CHAIN_S:
+                            key = (g2, p * s_)
+                            if key not in cache:
+                                cache[key] = chi_of(g2, p * s_)
+                            chain.append((g2, p * s_, cache[key], w * ws / len(par[1])))
+                if chain:
+                    # the chain is a prior for the data-poor steps: a step whose
+                    # own earners already tell its curve leans on them instead
+                    cw = CHAIN_W if e_last - b0 < CHAIN_DATA_X else CHAIN_W_DATA
+                    zi = sum(e[3] for e in indep) or 1.0
+                    zc = sum(e[3] for e in chain) or 1.0
+                    post = [(g, p, c, (1.0 - cw) * pr / zi) for g, p, c, pr in indep] + \
+                           [(g, p, c, cw * pr / zc) for g, p, c, pr in chain]
             cmin = min(c for _, _, c, _ in post)
             wts = [pr * math.exp(-0.5 * TEMPER * (c - cmin)) for _, _, c, pr in post]
+            posts[i] = _top(post, wts)
             vals = _sample_trophy(rng, post, wts, scen, b_past_t, b_fut, b0, e_lo_last, mis)
         if p_none > 1e-6 and r_last is not None:
             # with probability p_none the page has not refreshed by the target
@@ -528,14 +677,16 @@ def forecast_case(case):
             if k_none > 0:
                 vals = vals[: len(vals) - k_none] + [r_last] * k_none
         q = wquantiles(vals, [1.0] * len(vals), LEVELS)
-        qrows.append([clamp(v, 0.0, 100.0) for v in q])
+        qrows[i] = [clamp(v, 0.0, 100.0) for v in q]
 
     _monotone_pools(trophies, qrows)
     for tr, q in zip(trophies, qrows):
         prev = 0.0
         out = []
         for v in q:
-            v = round(max(v, prev), 4)
+            # the scorer clamps to 0.01..99.99 before its logit, so keeping
+            # every quantile strictly inside (0, 100) costs nothing
+            v = round(clamp(max(v, prev), 0.01, 99.99), 4)
             out.append(v)
             prev = v
         rows.append({"id": tr.get("id"), "q": out})
