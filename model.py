@@ -31,7 +31,25 @@ adds two things to this:
    parent's posterior shifted up the m grid (x1.27^0..6, same or wider sigma,
    p x 0.6..1).  Story missions borrow from the deepest chapter at least as
    many players hold.  The chain carries most weight while a step has fewer
-   than 10 earners of its own, and is off until a refresh has been observed.
+   than 30 earners of its own, and is off until a refresh has been observed.
+
+R4 (calibrated 2026-11-21 on the live reads to 56.5 h after release) changes
+the time-to-earn curve and its prior:
+
+7. Onset delay.  Play time per day is capped, so a trophy that needs T hours
+   of play is not earned in under about T / 0.75 wall hours: the time to earn
+   is a log-normal shifted by d * m, d in D_GRID.  Only a trophy with at least
+   D_DATA_X earners above its base fits d; with fewer, a late onset cannot be
+   told from a low reach and the plain log-normal is kept.
+8. m ceiling.  Past a median wall time of M_CEIL hours every m forecasts the
+   same week-one zero, so the grid stops there once a refresh has been seen
+   (the platinum and 100% keep the full grid); the low reach values carry the
+   hard trophies.
+9. Wording: collectible card sets and mission strands count as grinds.
+10. TEMPER 0.5 -> 0.35, 2,000 draws per trophy, and the story chain keeps 30%
+   of the weight once a step has 30 earners (R3: 10% after 10), since the
+   few Ch.3+ earners of day 2.5 are a cluster of story rushers, not the curve
+   the main body of players will follow.
 
 Standard library only, deterministic (seeded per case and trophy).
 """
@@ -54,17 +72,22 @@ ALPHA_SD = 0.45      # its prior sd
 LAM_SD = 0.18        # sd of the recent arrival rate (weekday/weekend swings)
 LAUNCH_BETA = 0.95   # N ~ (h + 1) ** beta when only one state is known
 LAUNCH_BETA_SD = 0.15
-TEMPER = 0.5         # likelihood tempering (cumulative counts are autocorrelated)
+TEMPER = 0.35        # likelihood tempering (cumulative counts are autocorrelated)
 KAPPA = 0.12         # proportional observation noise of a count
 PHI = 1.5            # Poisson over-dispersion of a count
 MIS = 0.35           # model error of the excess, per unit of log-time ahead
 MIS0 = 0.10
-N_SAMPLES = 800
+N_SAMPLES = 2000
 M_LO = 12.0
 M_HI = 5000.0
 M_N = 26
 M_GRID = tuple(math.exp(math.log(M_LO) + k * (math.log(M_HI) - math.log(M_LO)) / (M_N - 1)) for k in range(M_N))
 S_GRID = (0.5, 0.9, 1.4)
+# onset delay, as a share of m: nobody plays more than ~18 h a day, so a
+# trophy needing T hours of play cannot be earned in under ~T / 0.75 wall
+# hours, and the wall time-to-earn is a log-normal shifted by that floor
+D_GRID = (0.0, 0.1, 0.2)
+D_DATA_X = 30.0      # earners a trophy needs before its onset delay is fitted
 P_GRID = (0.03, 0.08, 0.18, 0.35, 0.6, 0.85, 1.0)
 
 
@@ -433,11 +456,12 @@ def g_cdf(tau, m, sig):
     return norm_cdf((math.log(tau) - math.log(m)) / sig)
 
 
-def basis(cohorts, t, m, sig):
+def basis(cohorts, t, m, sig, d=0.0):
     tot = 0.0
+    off = d * m
     for s, dn in cohorts:
-        if t > s:
-            tot += dn * g_cdf(t - s, m, sig)
+        if t > s + off:
+            tot += dn * g_cdf(t - s - off, m, sig)
     return tot
 
 
@@ -458,8 +482,10 @@ def trophy_kind(tr):
     return "side"
 
 
-# collection / completion wording: every spot, all challenges, 250 stunts ...
-_GRIND = re.compile(r"\b(all|every|each)\b|(?<![$,\d])\b([2-9]\d|\d{3,})\b(?!,)")
+# collection / completion wording: every spot, all challenges, 250 stunts,
+# 3 collectible card sets, 8 mission strands ...
+_GRIND = re.compile(r"\b(all|every|each)\b|(?<![$,\d])\b([2-9]\d|\d{3,})\b(?!,)"
+                    r"|\bcollectibles?\b|\b\d+ (mission )?(strands|sets)\b|\bcard sets?\b", re.I)
 
 
 P_PRIOR = {
@@ -474,12 +500,17 @@ P_PRIOR = {
 # the platinum and 100% completion take 150-200 hours of play: nobody who
 # started at launch can hold them inside a week
 M_FLOOR = {"platinum": 250.0, "completion": 250.0, "grind": 30.0}
+# ... and the grid stops at a median wall time to earn of M_CEIL hours for
+# the rest (a 250 h grind at the ~4 h of play a day of a typical launch-week
+# player): past that, m forecasts the same week-one zero as a low reach p,
+# and the log-uniform m prior would pile its mass onto that zero
+M_CEIL = {"story": 1500.0, "side": 1500.0, "grind": 1500.0}
 
 
 # hierarchical story chain (R3) ---------------------------------------------
 CHAIN_W = 0.75                      # prior weight of "this step follows its parent"
-CHAIN_W_DATA = 0.10                 # ... once the step has CHAIN_DATA_X earners of its own
-CHAIN_DATA_X = 10.0
+CHAIN_W_DATA = 0.30                 # ... once the step has CHAIN_DATA_X earners of its own
+CHAIN_DATA_X = 30.0
 CHAIN_S = ((0.6, 0.25), (0.8, 0.35), (1.0, 0.40))   # p scale and its prior
 # (m-grid shift, sigma-grid shift): chapter k+1 takes m x 1.27^0 .. 1.27^6 of
 # chapter k's time, with the same or a wider spread of reach times
@@ -586,10 +617,13 @@ def forecast_case(case):
         pick = _thin(recent, 26) + _thin(older, 14)
         obs_idx = sorted(set(pick))
 
-    grid = [(mm, ss) for mm in M_GRID for ss in S_GRID]
-    b_obs = [[basis(cohorts, states[j].h, mm, ss) for j in obs_idx] for mm, ss in grid]
-    b_past_t = [basis(cohorts, h_eff, mm, ss) for mm, ss in grid]
-    b_fut = [[basis(f, h_eff, mm, ss) for mm, ss in grid] for _, f, _ in scen]
+    nm, ns, nd = len(M_GRID), len(S_GRID), len(D_GRID)
+    grid = [(M_GRID[a], S_GRID[b], D_GRID[c]) for a in range(nm) for b in range(ns) for c in range(nd)]
+    gidx = {(a, b, c): (a * ns + b) * nd + c for a in range(nm) for b in range(ns) for c in range(nd)}
+    gpos = [(a, b, c) for a in range(nm) for b in range(ns) for c in range(nd)]
+    b_obs = [[basis(cohorts, states[j].h, mm, ss, dd) for j in obs_idx] for mm, ss, dd in grid]
+    b_past_t = [basis(cohorts, h_eff, mm, ss, dd) for mm, ss, dd in grid]
+    b_fut = [[basis(f, h_eff, mm, ss, dd) for mm, ss, dd in grid] for _, f, _ in scen]
 
     ahead = math.log((h_eff + N_C + 4.0) / (last.h + N_C + 4.0))
     mis = MIS0 + MIS * ahead
@@ -617,6 +651,9 @@ def forecast_case(case):
             kind = trophy_kind(tr)
             pp = P_PRIOR[kind]
             m_floor = M_FLOOR.get(kind, 0.0)
+            # (the ceiling binds on a week-long horizon; a history with no
+            # refresh yet keeps R2's full grid, as the practice cases do)
+            m_ceil = M_CEIL.get(kind, 1e9) if obs_idx else 1e9
             xs = []
             for j in obs_idx:
                 lo, hi = env_lo[j][i], env_hi[j][i]
@@ -632,8 +669,11 @@ def forecast_case(case):
                 return chi
 
             indep = []
+            # a delayed onset is only told apart from a low reach by a curve
+            # that has risen: the data-poor trophies keep the plain log-normal
+            d_ok = e_last - b0 >= D_DATA_X
             for g in range(len(grid)):
-                if grid[g][0] < m_floor:
+                if grid[g][0] < m_floor or grid[g][0] > m_ceil or (grid[g][2] > 0.0 and not d_ok):
                     continue
                 for k, p in enumerate(P_GRID):
                     indep.append((g, p, chi_of(g, p), pp[k]))
@@ -650,9 +690,11 @@ def forecast_case(case):
                 cache = {}
                 for (g, p, _, _), w in zip(ppost, pw):
                     for jsh, dsg in par[1]:
-                        si = g % 3 + dsg
-                        g2 = g - g % 3 + 3 * jsh + si
-                        if si > 2 or g2 < 0 or g2 >= len(grid) or grid[g2][0] < m_floor:
+                        a, b, c = gpos[g]
+                        if b + dsg >= ns or not 0 <= a + jsh < nm:
+                            continue
+                        g2 = gidx[(a + jsh, b + dsg, c)]
+                        if grid[g2][0] < m_floor or grid[g2][0] > m_ceil:
                             continue
                         for s_, ws in CHAIN_S:
                             key = (g2, p * s_)
